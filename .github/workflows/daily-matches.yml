@@ -39,45 +39,103 @@ jobs:
               big = sum(any(b == n.lower() or b in n.lower() for b in BIG) for n in (home, away))
               return base + big * 25 if big or base >= 75 else None
           
+          
+          import re,hashlib,urllib.parse
+          WIKI_PAGE='قائمة_مباريات_الدوري_المصري_الممتاز_2026-27'
+          WIKI_API='https://ar.wikipedia.org/w/api.php?'+urllib.parse.urlencode({'action':'parse','page':WIKI_PAGE,'prop':'wikitext','format':'json'})
+          WIKI_URL='https://ar.wikipedia.org/wiki/'+urllib.parse.quote(WIKI_PAGE)
+          def parse_egypt(text):
+              digits=str.maketrans('٠١٢٣٤٥٦٧٨٩','0123456789')
+              months={'يناير':1,'فبراير':2,'مارس':3,'أبريل':4,'مايو':5,'يونيو':6,'يوليو':7,'أغسطس':8,'سبتمبر':9,'أكتوبر':10,'نوفمبر':11,'ديسمبر':12}
+              def clean(value):
+                  return re.sub(r'\[\[([^\]|]*\|)?([^\]]+)\]\]',r'\2',value).strip()
+              fixtures=[];skipped=0
+              for block in text.split('{{صندوق كرة قدم قابل للطي')[1:]:
+                  fields=dict(re.findall(r'^\|\s*(تاريخ|وقت|فريق1|فريق2)\s*=\s*(.*?)\s*$',block,re.M))
+                  try:
+                      date=fields['تاريخ'].translate(digits)
+                      for name,num in months.items():date=date.replace(name,str(num))
+                      d,m,y=map(int,re.findall(r'\d+',date))
+                      hour,minute=map(int,re.findall(r'\d+',fields['وقت'].translate(digits)))
+                      local=datetime.datetime(y,m,d,hour,minute,tzinfo=ZoneInfo('Africa/Cairo'))
+                      home=clean(fields['فريق1']);away=clean(fields['فريق2'])
+                      if not home or not away:raise ValueError('missing teams')
+                      rank=95+25*sum(any(t in n for t in ('الأهلي','الزمالك','بيراميدز')) for n in (home,away))
+                      fixtures.append({'id':'egy-'+hashlib.sha256(f'{home}|{away}|{y}-{m}-{d}'.encode()).hexdigest()[:16],'league':'الدوري المصري','leagueId':'egy.1','home':home,'away':away,'kickoff':local.astimezone(datetime.timezone.utc).isoformat(),'day':local.date().isoformat(),'homeColor':'bc263a','awayColor':'246760','priority':rank,'source':'wikipedia'})
+                  except (KeyError,ValueError):skipped+=1
+              if len(fixtures)<10 or skipped>len(fixtures)*.1:raise ValueError('Egypt source structure changed')
+              return fixtures
+          
+          def egypt_snapshot(now):
+              cache=Path('egypt-fixtures.json')
+              prior={}
+              try:prior=json.loads(cache.read_text())
+              except Exception:pass
+              try:
+                  age=now-datetime.datetime.fromisoformat(prior['fetchedAt'])
+                  if datetime.timedelta(0)<=age<datetime.timedelta(days=7):return prior
+              except Exception:pass
+              try:
+                  req=urllib.request.Request(WIKI_API,headers={'User-Agent':'IbrahimTV/2.9.1 (fixtures; github.com/cibrahim258654-sys)'})
+                  with urllib.request.urlopen(req,timeout=30) as response:data=json.load(response)
+                  fixtures=parse_egypt(data['parse']['wikitext']['*'])
+                  result={'status':'ok','fetchedAt':now.isoformat(),'sourceUrl':WIKI_URL,'license':'CC BY-SA','matches':fixtures}
+              except Exception:
+                  result={'status':'unavailable','fetchedAt':now.isoformat(),'sourceUrl':WIKI_URL,'license':'CC BY-SA','matches':[]}
+              cache.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')
+              return result
+          
           def fetch():
-              now=datetime.datetime.now(datetime.timezone.utc); cairo=ZoneInfo('Africa/Cairo'); events={}; failures=[]; success=0
-              for slug,(label,base) in LEAGUES.items():
-                  for delta in (-1,0,1):
-                      day=(now+datetime.timedelta(days=delta)).strftime('%Y%m%d')
-                      url=f'https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard?dates={day}&limit=100'
-                      try:
-                          req=urllib.request.Request(url,headers={'User-Agent':'IbrahimTV fixtures/1.0'})
-                          with urllib.request.urlopen(req,timeout=15) as response: data=json.load(response)
-                          if not data.get('leagues') or not isinstance(data.get('events'),list): raise ValueError('invalid payload')
-                          success+=1
-                          for e in data['events']:
-                              competition=e.get('competitions',[{}])[0]; teams=competition.get('competitors',[])
-                              home=next((t for t in teams if t.get('homeAway')=='home'),None); away=next((t for t in teams if t.get('homeAway')=='away'),None)
-                              if not home or not away: continue
-                              hn=home['team']['displayName']; an=away['team']['displayName']; rank=important(hn,an,base)
-                              if rank is None: continue
-                              kickoff=datetime.datetime.fromisoformat(e['date'].replace('Z','+00:00'))
-                              local=kickoff.astimezone(cairo).date().isoformat()
-                              if local not in {(now.astimezone(cairo)+datetime.timedelta(days=i)).date().isoformat() for i in (0,1)}: continue
-                              state=e.get('status',{}).get('type',{}).get('name','')
-                              if state in ('STATUS_CANCELED','STATUS_POSTPONED'): continue
-                              events[e['id']]={'id':e['id'],'league':label,'home':hn,'away':an,'kickoff':e['date'],'day':local,'homeLogo':home['team'].get('logo',''),'awayLogo':away['team'].get('logo',''),'priority':rank}
-                      except Exception as exc: failures.append(slug+':'+day)
+              from concurrent.futures import ThreadPoolExecutor
+              now=datetime.datetime.now(datetime.timezone.utc); cairo=ZoneInfo('Africa/Cairo'); today=now.astimezone(cairo).date()
+              days=[(today+datetime.timedelta(days=i)).strftime('%Y%m%d') for i in range(-1,31)]
+              def source(task):
+                  slug,day=task
+                  url=f'https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard?dates={day}&limit=100'
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'IbrahimTV fixtures/1.1'})
+                      with urllib.request.urlopen(req,timeout=20) as response: data=json.load(response)
+                      if not data.get('leagues') or not isinstance(data.get('events'),list): raise ValueError('invalid payload')
                       time.sleep(.15)
-              if success < len(LEAGUES)*2: raise RuntimeError('Too many source failures; preserving prior file')
-              selected=[]
-              for day in sorted({e['day'] for e in events.values()}):
-                  top=sorted([e for e in events.values() if e['day']==day],key=lambda e:(-e['priority'],e['kickoff']))[:8]
-                  selected.extend(sorted(top,key=lambda e:e['kickoff']))
-              payload={'schema':1,'generatedAt':now.isoformat(),'timezone':'Africa/Cairo','partial':bool(failures),'matches':selected}
-              Path('matches.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2)+'\n')
-              print(f'Wrote {len(selected)} important fixtures; successful source requests {success}; failures {len(failures)}')
+                      return slug,day,data
+                  except Exception: return slug,day,None
+              tasks=[(slug,day) for day in days for slug in LEAGUES]
+              events={};failures=[];successful={day:0 for day in days}
+              with ThreadPoolExecutor(max_workers=4) as pool:
+                  for slug,day,data in pool.map(source,tasks):
+                      if data is None: failures.append(slug+':'+day);continue
+                      successful[day]+=1
+                      label,base=LEAGUES[slug]
+                      for e in data['events']:
+                          try:
+                              competition=e.get('competitions',[{}])[0];teams=competition.get('competitors',[])
+                              home=next(t['team'] for t in teams if t.get('homeAway')=='home');away=next(t['team'] for t in teams if t.get('homeAway')=='away')
+                              hn=home['displayName'];an=away['displayName'];rank=important(hn,an,base) or base
+                              kickoff=datetime.datetime.fromisoformat(e['date'].replace('Z','+00:00'));local=kickoff.astimezone(cairo).date()
+                              if not today <= local <= today+datetime.timedelta(days=30):continue
+                              if e.get('status',{}).get('type',{}).get('name','') in ('STATUS_CANCELED','STATUS_POSTPONED'):continue
+                              events[e['id']]={'id':e['id'],'league':label,'leagueId':slug,'home':hn,'away':an,'kickoff':e['date'],'day':local.isoformat(),'homeLogo':home.get('logo',''),'awayLogo':away.get('logo',''),'homeColor':home.get('color','2854a1'),'awayColor':away.get('color','962d5c'),'priority':rank,'source':'espn'}
+                          except (KeyError,ValueError,StopIteration,IndexError):continue
+              if any(count < len(LEAGUES)*.8 for count in successful.values()):raise RuntimeError('Source coverage incomplete; preserving prior files')
+              egypt=egypt_snapshot(now)
+              for event in egypt['matches']:
+                  if today.isoformat()<=event['day']<=(today+datetime.timedelta(days=30)).isoformat():events[event['id']]=event
+              selected=sorted(events.values(),key=lambda e:(e['day'],-e['priority'],e['kickoff'],e['id']))
+              payload={'schema':1,'generatedAt':now.isoformat(),'timezone':'Africa/Cairo','partial':bool(failures),'fromDay':today.isoformat(),'throughDay':(today+datetime.timedelta(days=30)).isoformat(),'sources':{'egypt':{'status':egypt['status'],'fetchedAt':egypt['fetchedAt'],'sourceUrl':egypt['sourceUrl'],'license':egypt['license'],'latestDay':max((e['day'] for e in egypt['matches']),default='')}},'matches':selected}
+              Path('matches-month.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2)+'\n')
+              # Preserve compatibility for 2.9.0 clients until users install the update.
+              legacy=dict(payload);legacy['matches']=[]
+              for delta in (0,1):
+                  day=(today+datetime.timedelta(days=delta)).isoformat()
+                  legacy['matches'].extend([e for e in selected if e['day']==day][:8])
+              Path('matches.json').write_text(json.dumps(legacy,ensure_ascii=False,indent=2)+'\n')
+              print(f'Wrote {len(selected)} fixtures across 31 days; failures {len(failures)}')
           if __name__=='__main__': fetch()
       - name: Commit fixture snapshot
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add matches.json
+          git add matches.json matches-month.json egypt-fixtures.json
           git diff --cached --quiet || git commit -m 'Update important matches'
           git pull --rebase origin main
           git push
